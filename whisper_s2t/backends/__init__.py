@@ -1,10 +1,11 @@
-import torch
-from tqdm import tqdm
 from abc import ABC, abstractmethod
 
+import torch
+from tqdm import tqdm
+
+from ..audio import LogMelSpectogram
 from ..configs import *
 from ..data import WhisperDataLoader
-from ..audio import LogMelSpectogram
 from ..speech_segmenter import SpeechSegmenter
 
 
