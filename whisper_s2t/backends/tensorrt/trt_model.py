@@ -20,6 +20,7 @@ class WhisperEncoding:
         with open(config_path, 'r') as f:
             config = json.load(f)
 
+        use_gpt_attention_plugin = config['plugin_config']['gpt_attention_plugin']  # noqa
         dtype = config['builder_config']['precision']
         n_mels = config['builder_config']['n_mels']
         num_languages = config['builder_config']['num_languages']
@@ -28,7 +29,7 @@ class WhisperEncoding:
         self.n_mels = n_mels
         self.num_languages = num_languages
 
-        serialize_path = engine_dir / f'encoder.engine'
+        serialize_path = engine_dir / f'whisper_encoder_{self.dtype}_tp1_rank0.engine'  # noqa
 
         with open(serialize_path, 'rb') as f:
             session = Session.from_serialized_engine(f.read())
@@ -53,7 +54,6 @@ class WhisperEncoding:
         ]
 
         output_info = (self.session).infer_shapes(output_list)
-
         outputs = {
             t.name: torch.empty(tuple(t.shape),
                                 dtype=trt_dtype_to_torch(t.dtype),
@@ -68,7 +68,7 @@ class WhisperEncoding:
         stream.synchronize()
         audio_features = outputs['output']
         return audio_features
-        
+
 
 class WhisperDecoding:
 
@@ -89,11 +89,13 @@ class WhisperDecoding:
 
     def get_session(self, engine_dir, runtime_mapping, debug_mode=False):
         dtype = self.decoder_config['precision']
-        serialize_path = engine_dir / f'decoder.engine'
+        serialize_path = engine_dir / f'whisper_decoder_{dtype}_tp1_rank0.engine'  # noqa
         with open(serialize_path, "rb") as f:
             decoder_engine_buffer = f.read()
 
         decoder_model_config = ModelConfig(
+            max_batch_size=self.decoder_config['max_batch_size'],
+            max_beam_width=self.decoder_config['max_beam_width'],
             num_heads=self.decoder_config['num_heads'],
             num_kv_heads=self.decoder_config['num_heads'],
             hidden_size=self.decoder_config['hidden_size'],
@@ -118,10 +120,12 @@ class WhisperDecoding:
     def generate(self,
                  decoder_input_ids,
                  encoder_outputs,
-                 sampling_config):
-        
+                 eot_id,
+                 max_new_tokens=40,
+                 num_beams=1):
         encoder_input_lengths = torch.tensor(
-            [encoder_outputs.shape[1] for x in range(encoder_outputs.shape[0])],
+            [encoder_outputs.shape[1]
+                for x in range(encoder_outputs.shape[0])],
             dtype=torch.int32,
             device='cuda')
 
@@ -129,15 +133,21 @@ class WhisperDecoding:
             decoder_input_ids.shape[-1]
             for _ in range(decoder_input_ids.shape[0])
         ],
-                                             dtype=torch.int32,
-                                             device='cuda')
+            dtype=torch.int32,
+            device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
+        cross_attention_mask = torch.ones([encoder_outputs.shape[0], 1, encoder_outputs.shape[1]]).int().cuda()  # noqa
+
+        # generation config
+        sampling_config = SamplingConfig(end_id=eot_id,
+                                         pad_id=eot_id,
+                                         num_beams=num_beams)
         self.decoder_generation_session.setup(
             decoder_input_lengths.size(0),
             decoder_max_input_length,
-            sampling_config.max_new_tokens,
-            beam_width=sampling_config.num_beams,
+            max_new_tokens,
+            beam_width=num_beams,
             encoder_max_input_length=encoder_outputs.shape[1])
 
         torch.cuda.synchronize()
@@ -149,6 +159,7 @@ class WhisperDecoding:
             sampling_config,
             encoder_output=encoder_outputs,
             encoder_input_lengths=encoder_input_lengths,
+            cross_attention_mask=cross_attention_mask,
         )
         torch.cuda.synchronize()
 
@@ -164,13 +175,13 @@ class WhisperTRT:
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
         engine_dir = Path(engine_dir)
-        
+
         self.encoder = WhisperEncoding(engine_dir)
         self.decoder = WhisperDecoding(engine_dir, runtime_mapping)
         self.n_mels = self.encoder.n_mels
         self.is_multilingual = True
         self.compute_type = compute_type
-        
+
     def encode(self, mel):
         return self.encoder.get_audio_features(mel.type(str_dtype_to_torch(self.compute_type)))
 
@@ -179,9 +190,9 @@ class WhisperTRT:
             features = self.encode(features)
 
         decoder_input_ids = torch.tensor(prompts)
-            
+
         sampling_config = SamplingConfig(**generate_kwargs)
-        
+
         output_ids = self.decoder.generate(decoder_input_ids,
                                            features,
                                            sampling_config)
